@@ -1,0 +1,624 @@
+name: Build APK
+on:
+  push:
+    branches:
+      - main
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Install Gradle 8.9
+        run: |
+          wget -q https://services.gradle.org/distributions/gradle-8.9-bin.zip -O gradle.zip
+          unzip -q gradle.zip -d /opt/gradle
+          echo "/opt/gradle/gradle-8.9/bin" >> $GITHUB_PATH
+
+      - name: Create Project Structure
+        run: |
+          mkdir -p app/src/main/java/com/sadtaz/workout
+          mkdir -p app/src/main/res/layout
+          mkdir -p app/src/main/res/drawable
+          mkdir -p app/src/main/res/values
+
+      - name: Write Kotlin Files
+        run: |
+          cat > app/src/main/java/com/sadtaz/workout/WorkoutData.kt << 'EOF'
+          package com.sadtaz.workout
+          enum class ExerciseType { NORMAL, PLANK, CARDIO }
+          fun getExerciseType(name: String): ExerciseType = when (name) {
+              "Plank"  -> ExerciseType.PLANK
+              "Cardio" -> ExerciseType.CARDIO
+              else     -> ExerciseType.NORMAL
+          }
+          data class WorkoutDay(val dayCode: String, val dayLabel: String, val muscleGroup: String, val exercises: List<String>)
+          object WorkoutPlan {
+              val days = listOf(
+                  WorkoutDay("MON", "Monday", "Chest", listOf("Bench Press", "Incline Bench Press", "Pec Fly", "Cable Crossover")),
+                  WorkoutDay("TUE", "Tuesday", "Back", listOf("Lat Pulldown", "T-Bar Row", "Single Hand Dumbbell Row")),
+                  WorkoutDay("WED", "Wednesday", "Legs", listOf("Squat", "Leg Press", "Leg Extension", "Leg Curl", "Calf Raises")),
+                  WorkoutDay("THU", "Thursday", "Shoulders", listOf("Dumbbell Press", "Cable Side Lateral", "Cable Rear Delt Pull")),
+                  WorkoutDay("FRI", "Friday", "Biceps & Triceps", listOf("Dumbbell Curl", "Preacher Curl", "Hammer Curl", "Overhead Tricep Extension", "Cable Pushdown")),
+                  WorkoutDay("SAT", "Saturday", "Cardio & Abs", listOf("Abs Crunches", "Plank", "Cardio"))
+              )
+              fun forDayCode(code: String) = days.find { it.dayCode == code }
+          }
+          data class SetInput(val setNumber: Int, var reps: Int = 0, var weightKg: Float = 0f, var minutes: Float = 0f, var speedKmh: Float = 0f)
+          class WorkoutRepository(private val dao: WorkoutDao) {
+              fun getAllSets() = dao.getAllSets()
+              fun getSetsForDate(date: String) = dao.getSetsForDate(date)
+              fun getAllWorkoutDates() = dao.getAllWorkoutDates()
+              fun getTotalWorkoutDays() = dao.getTotalWorkoutDays()
+              fun getTotalSets() = dao.getTotalSets()
+              fun getHistoryForExercise(ex: String) = dao.getHistoryForExercise(ex)
+              fun getMaxWeight(ex: String) = dao.getMaxWeight(ex)
+              fun getMaxMinutes(ex: String) = dao.getMaxMinutes(ex)
+              suspend fun getSetsForExerciseAndDate(exercise: String, date: String) = dao.getSetsForExerciseAndDate(exercise, date)
+              suspend fun saveSets(exercise: String, muscle: String, dayCode: String, date: String, sets: List<SetInput>) {
+                  dao.deleteExerciseForDate(exercise, date)
+                  val entities = sets.map { s -> WorkoutSet(exerciseName = exercise, muscleGroup = muscle, dayOfWeek = dayCode, setNumber = s.setNumber, loggedDate = date, reps = s.reps, weightKg = s.weightKg, minutes = s.minutes, speedKmh = s.speedKmh) }
+                  dao.insertSets(entities)
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/sadtaz/workout/Database.kt << 'EOF'
+          package com.sadtaz.workout
+          import android.content.Context
+          import androidx.room.*
+          import kotlinx.coroutines.flow.Flow
+          @Entity(tableName = "workout_sets")
+          data class WorkoutSet(@PrimaryKey(autoGenerate = true) val id: Int = 0, val exerciseName: String, val muscleGroup: String, val dayOfWeek: String, val setNumber: Int, val loggedDate: String, val timestamp: Long = System.currentTimeMillis(), val reps: Int = 0, val weightKg: Float = 0f, val minutes: Float = 0f, val speedKmh: Float = 0f)
+          @Dao
+          interface WorkoutDao {
+              @Insert(onConflict = OnConflictStrategy.REPLACE) suspend fun insertSets(sets: List<WorkoutSet>)
+              @Query("DELETE FROM workout_sets WHERE exerciseName = :exercise AND loggedDate = :date") suspend fun deleteExerciseForDate(exercise: String, date: String)
+              @Query("SELECT * FROM workout_sets WHERE loggedDate = :date ORDER BY exerciseName, setNumber") fun getSetsForDate(date: String): Flow<List<WorkoutSet>>
+              @Query("SELECT * FROM workout_sets WHERE exerciseName = :exercise ORDER BY loggedDate ASC") fun getHistoryForExercise(exercise: String): Flow<List<WorkoutSet>>
+              @Query("SELECT * FROM workout_sets ORDER BY timestamp DESC") fun getAllSets(): Flow<List<WorkoutSet>>
+              @Query("SELECT DISTINCT loggedDate FROM workout_sets ORDER BY loggedDate DESC") fun getAllWorkoutDates(): Flow<List<String>>
+              @Query("SELECT * FROM workout_sets WHERE loggedDate = :date AND exerciseName = :exercise ORDER BY setNumber") suspend fun getSetsForExerciseAndDate(exercise: String, date: String): List<WorkoutSet>
+              @Query("SELECT COUNT(DISTINCT loggedDate) FROM workout_sets") fun getTotalWorkoutDays(): Flow<Int>
+              @Query("SELECT COUNT(*) FROM workout_sets") fun getTotalSets(): Flow<Int>
+              @Query("SELECT MAX(weightKg) FROM workout_sets WHERE exerciseName = :exercise AND weightKg > 0") fun getMaxWeight(exercise: String): Flow<Float?>
+              @Query("SELECT MAX(minutes) FROM workout_sets WHERE exerciseName = :exercise AND minutes > 0") fun getMaxMinutes(exercise: String): Flow<Float?>
+          }
+          @Database(entities = [WorkoutSet::class], version = 1, exportSchema = false)
+          abstract class WorkoutDatabase : RoomDatabase() {
+              abstract fun workoutDao(): WorkoutDao
+              companion object {
+                  @Volatile private var INSTANCE: WorkoutDatabase? = null
+                  fun getInstance(context: Context): WorkoutDatabase = INSTANCE ?: synchronized(this) { Room.databaseBuilder(context.applicationContext, WorkoutDatabase::class.java, "sadtaz_workout_db").build().also { INSTANCE = it } }
+              }
+          }
+          EOF
+
+      - name: Write Activity Files
+        run: |
+          cat > app/src/main/java/com/sadtaz/workout/MainActivity.kt << 'EOF'
+          package com.sadtaz.workout
+          import android.content.Intent
+          import android.os.Bundle
+          import android.view.*
+          import android.widget.TextView
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.recyclerview.widget.LinearLayoutManager
+          import androidx.recyclerview.widget.RecyclerView
+          import com.google.android.material.tabs.TabLayout
+          import java.text.SimpleDateFormat
+          import java.util.*
+          class MainActivity : AppCompatActivity() {
+              private var selectedDayIndex = 0
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContentView(R.layout.activity_main)
+                  val tabLayout = findViewById<TabLayout>(R.id.tabLayout)
+                  val tvTitle   = findViewById<TextView>(R.id.tvDayTitle)
+                  val tvMuscle  = findViewById<TextView>(R.id.tvMuscle)
+                  val tvDate    = findViewById<TextView>(R.id.tvDate)
+                  val recycler  = findViewById<RecyclerView>(R.id.recyclerView)
+                  tvDate.text = SimpleDateFormat("dd MMM yyyy", Locale.getDefault()).format(Date())
+                  val todayCode = when (Calendar.getInstance().get(Calendar.DAY_OF_WEEK)) {
+                      Calendar.MONDAY -> "MON"; Calendar.TUESDAY -> "TUE"; Calendar.WEDNESDAY -> "WED"
+                      Calendar.THURSDAY -> "THU"; Calendar.FRIDAY -> "FRI"; Calendar.SATURDAY -> "SAT"
+                      else -> "MON"
+                  }
+                  selectedDayIndex = WorkoutPlan.days.indexOfFirst { it.dayCode == todayCode }.coerceAtLeast(0)
+                  WorkoutPlan.days.forEach { tabLayout.addTab(tabLayout.newTab().setText(it.dayCode)) }
+                  tabLayout.getTabAt(selectedDayIndex)?.select()
+                  fun loadDay(index: Int) {
+                      val day = WorkoutPlan.days[index]
+                      tvTitle.text = day.dayLabel
+                      tvMuscle.text = day.muscleGroup
+                      recycler.layoutManager = LinearLayoutManager(this)
+                      recycler.adapter = ExerciseAdapter(day) { ex ->
+                          startActivity(Intent(this, LogWorkoutActivity::class.java).apply {
+                              putExtra("exercise", ex); putExtra("muscle", day.muscleGroup); putExtra("dayCode", day.dayCode)
+                          })
+                      }
+                  }
+                  tabLayout.addOnTabSelectedListener(object : TabLayout.OnTabSelectedListener {
+                      override fun onTabSelected(t: TabLayout.Tab) { selectedDayIndex = t.position; loadDay(selectedDayIndex) }
+                      override fun onTabUnselected(t: TabLayout.Tab) {}
+                      override fun onTabReselected(t: TabLayout.Tab) {}
+                  })
+                  loadDay(selectedDayIndex)
+                  findViewById<View>(R.id.btnHistory).setOnClickListener { startActivity(Intent(this, HistoryActivity::class.java)) }
+                  findViewById<View>(R.id.btnGraph).setOnClickListener { startActivity(Intent(this, GraphActivity::class.java)) }
+              }
+          }
+          class ExerciseAdapter(private val day: WorkoutDay, private val onClick: (String) -> Unit) : RecyclerView.Adapter<ExerciseAdapter.VH>() {
+              inner class VH(v: View) : RecyclerView.ViewHolder(v) {
+                  val tvName: TextView = v.findViewById(R.id.tvExerciseName)
+                  val tvSub: TextView = v.findViewById(R.id.tvTapToLog)
+              }
+              override fun onCreateViewHolder(p: ViewGroup, t: Int) = VH(LayoutInflater.from(p.context).inflate(R.layout.item_exercise, p, false))
+              override fun onBindViewHolder(h: VH, pos: Int) {
+                  val ex = day.exercises[pos]
+                  h.tvName.text = ex
+                  h.tvSub.text = when (getExerciseType(ex)) { ExerciseType.PLANK -> "Sets � Minutes"; ExerciseType.CARDIO -> "Sets � Minutes � Speed"; else -> "Reps � Weight (kg)" }
+                  h.itemView.setOnClickListener { onClick(ex) }
+              }
+              override fun getItemCount() = day.exercises.size
+          }
+          EOF
+
+          cat > app/src/main/java/com/sadtaz/workout/HistoryActivity.kt << 'EOF'
+          package com.sadtaz.workout
+          import android.os.Bundle
+          import android.view.*
+          import android.widget.*
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.lifecycle.lifecycleScope
+          import androidx.recyclerview.widget.LinearLayoutManager
+          import androidx.recyclerview.widget.RecyclerView
+          import kotlinx.coroutines.flow.collectLatest
+          import kotlinx.coroutines.launch
+          class HistoryActivity : AppCompatActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContentView(R.layout.activity_history)
+                  findViewById<ImageView>(R.id.btnBack).setOnClickListener { finish() }
+                  val repo = WorkoutRepository(WorkoutDatabase.getInstance(this).workoutDao())
+                  val rv = findViewById<RecyclerView>(R.id.rvHistory)
+                  rv.layoutManager = LinearLayoutManager(this)
+                  lifecycleScope.launch {
+                      repo.getAllSets().collectLatest { allSets ->
+                          val items = mutableListOf<HistoryItem>()
+                          if (allSets.isEmpty()) { items.add(HistoryItem.Header("Abhi koi workout log nahi hai")); rv.adapter = HistoryAdapter(items); return@collectLatest }
+
+                  
+                          allSets.groupBy { it.loggedDate }.entries.sortedByDescending { it.key }.forEach { (date, daySets) ->
+                              items.add(HistoryItem.Header(date))
+                              daySets.groupBy { it.exerciseName }.forEach { (ex, exSets) ->
+                                  val type = getExerciseType(ex)
+                                  val detail = when (type) { ExerciseType.PLANK -> "${exSets.size} sets ��� ${exSets.maxOf { it.minutes }} min max"; ExerciseType.CARDIO -> "${exSets.size} sets ��� ${exSets.maxOf { it.minutes }} min ��� ${exSets.maxOf {
+                                  it.speedKmh }} km/h"; else -> "${exSets.size} sets ��� ${exSets.maxOf { it.weightKg }} kg max" }
+                                  items.add(HistoryItem.Entry(ex, exSets.first().muscleGroup, detail))
+                              }
+                          }
+                          rv.adapter = HistoryAdapter(items)
+                      }
+                  }
+              }
+          }
+          sealed class HistoryItem { data class Header(val date: String) : HistoryItem(); data class Entry(val exercise: String, val muscle: String, val detail: String) : HistoryItem() }
+          class HistoryAdapter(private val items: List<HistoryItem>) : RecyclerView.Adapter<RecyclerView.ViewHolder>() {
+              override fun getItemViewType(pos: Int) = if (items[pos] is HistoryItem.Header) 0 else 1
+              override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): RecyclerView.ViewHolder {
+                  val layout = if (viewType == 0) R.layout.item_history_date else R.layout.item_history_entry
+                  return object : RecyclerView.ViewHolder(LayoutInflater.from(parent.context).inflate(layout, parent, false)) {}
+              }
+              override fun onBindViewHolder(holder: RecyclerView.ViewHolder, pos: Int) {
+                  when (val item = items[pos]) {
+                      is HistoryItem.Header -> holder.itemView.findViewById<TextView>(R.id.tvDate).text = item.date
+                      is HistoryItem.Entry -> { holder.itemView.findViewById<TextView>(R.id.tvExName).text = item.exercise; holder.itemView.findViewById<TextView>(R.id.tvDetail).text = "${item.muscle} ��� ${item.detail}" }
+                  }
+              }
+              override fun getItemCount() = items.size
+          }
+          EOF
+
+      - name: Write LogWorkout and Graph Activities
+        run: |
+          cat > app/src/main/java/com/sadtaz/workout/LogWorkoutActivity.kt << 'EOF'
+          package com.sadtaz.workout
+          import android.os.Bundle
+          import android.text.Editable
+          import android.text.TextWatcher
+          import android.view.*
+          import android.widget.*
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.lifecycle.lifecycleScope
+          import androidx.recyclerview.widget.LinearLayoutManager
+          import androidx.recyclerview.widget.RecyclerView
+          import kotlinx.coroutines.launch
+          import java.text.SimpleDateFormat
+          import java.util.*
+          class LogWorkoutActivity : AppCompatActivity() {
+              private lateinit var repo: WorkoutRepository
+              private lateinit var exercise: String
+              private lateinit var muscle: String
+              private lateinit var dayCode: String
+              private lateinit var todayDate: String
+              private lateinit var exType: ExerciseType
+              private val setInputs = mutableListOf<SetInput>()
+              private lateinit var setsAdapter: SetsInputAdapter
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContentView(R.layout.activity_log_workout)
+                  exercise = intent.getStringExtra("exercise") ?: run { finish(); return }
+                  muscle = intent.getStringExtra("muscle") ?: ""
+                  dayCode = intent.getStringExtra("dayCode") ?: ""
+                  exType = getExerciseType(exercise)
+                  todayDate = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
+                  repo = WorkoutRepository(WorkoutDatabase.getInstance(this).workoutDao())
+                  findViewById<TextView>(R.id.tvExerciseTitle).text = exercise
+                  findViewById<TextView>(R.id.tvMuscleLabel).text = muscle
+                  findViewById<ImageView>(R.id.btnBack).setOnClickListener { finish() }
+                  val tvH1 = findViewById<TextView>(R.id.tvColA); val tvH2 = findViewById<TextView>(R.id.tvColB); val tvH3 = findViewById<TextView>(R.id.tvColC)
+                  when (exType) { ExerciseType.PLANK -> { tvH1.text = "SET"; tvH2.text = "MINUTES"; tvH3.visibility = View.GONE }; ExerciseType.CARDIO -> { tvH1.text = "SET"; tvH2.text = "MINUTES"; tvH3.text = "SPEED (km/h)"; tvH3.visibility = View.VISIBLE }; else -> { tvH1.text = "SET"; tvH2.text = "REPS"; tvH3.text = "WEIGHT (kg)"; tvH3.visibility = View.VISIBLE } }
+                  val rv = findViewById<RecyclerView>(R.id.rvSets)
+                  setsAdapter = SetsInputAdapter(setInputs, exType)
+                  rv.layoutManager = LinearLayoutManager(this)
+                  rv.adapter = setsAdapter
+                  lifecycleScope.launch {
+                      val existing = repo.getSetsForExerciseAndDate(exercise, todayDate)
+                      setInputs.clear()
+                      if (existing.isNotEmpty()) existing.forEach { setInputs.add(SetInput(it.setNumber, it.reps, it.weightKg, it.minutes, it.speedKmh)) } else setInputs.add(SetInput(1))
+                      setsAdapter.notifyDataSetChanged()
+                  }
+                  findViewById<Button>(R.id.btnAddSet).setOnClickListener { setInputs.add(SetInput(setInputs.size � 1)); setsAdapter.notifyItemInserted(setInputs.size - 1); rv.smoothScrollToPosition(setInputs.size - 1) }
+                  findViewById<Button>(R.id.btnSave).setOnClickListener {
+                      lifecycleScope.launch {
+                          val toSave = setInputs.filterIndexed { _, s -> when (exType) { ExerciseType.PLANK, ExerciseType.CARDIO -> s.minutes > 0f; else -> s.reps > 0 || s.weightKg > 0f } }.mapIndexed { i, s -> s.copy(setNumber = i � 1) }
+                          if (toSave.isEmpty()) { Toast.makeText(this@LogWorkoutActivity, "Kuch values enter karo pehle!", Toast.LENGTH_SHORT).show(); return@launch }
+                          repo.saveSets(exercise, muscle, dayCode, todayDate, toSave)
+                          Toast.makeText(this@LogWorkoutActivity, "Saved!", Toast.LENGTH_SHORT).show()
+                          finish()
+                      }
+                  }
+              }
+          }
+          class SetsInputAdapter(private val sets: MutableList<SetInput>, private val type: ExerciseType) : RecyclerView.Adapter<SetsInputAdapter.VH>() {
+              inner class VH(v: View) : RecyclerView.ViewHolder(v) { val tvNum: TextView = v.findViewById(R.id.tvSetNum); val etA: EditText = v.findViewById(R.id.etFieldA); val etB: EditText = v.findViewById(R.id.etFieldB); val etC: EditText = v.findViewById(R.id.etFieldC); val btnDel: ImageView = v.findViewById(R.id.btnDelSet); var watcherA: TextWatcher? = null; var watcherB: TextWatcher? = null }
+              override fun onCreateViewHolder(parent: ViewGroup, viewType: Int) = VH(LayoutInflater.from(parent.context).inflate(R.layout.item_set_row, parent, false))
+              override fun onBindViewHolder(holder: VH, position: Int) {
+                  val s = sets[position]
+                  holder.tvNum.text = "${position � 1}"
+                  holder.etA.removeTextChangedListener(holder.watcherA); holder.etB.removeTextChangedListener(holder.watcherB)
+                  when (type) { ExerciseType.PLANK -> { holder.etA.hint = "Minutes"; holder.etA.setText(if (s.minutes > 0f) s.minutes.toString() else ""); holder.etB.visibility = View.GONE; holder.etC.visibility = View.GONE }; ExerciseType.CARDIO -> { holder.etA.hint = "Minutes"; holder.etB.hint = "Speed (km/h)"; holder.etA.setText(if (s.minutes > 0f) s.minutes.toString() else ""); holder.etB.setText(if (s.speedKmh > 0f) s.speedKmh.toString() else ""); holder.etB.visibility = View.VISIBLE; holder.etC.visibility = View.GONE }; else -> { holder.etA.hint = "Reps"; holder.etB.hint = "Weight (kg)"; holder.etA.setText(if (s.reps > 0) s.reps.toString() else ""); holder.etB.setText(if (s.weightKg > 0f) s.weightKg.toString() else ""); holder.etB.visibility = View.VISIBLE; holder.etC.visibility = View.GONE } }
+                  holder.watcherA = watcher { text -> val idx = holder.adapterPosition; if (idx < 0) return@watcher; when (type) { ExerciseType.PLANK, ExerciseType.CARDIO -> sets[idx].minutes = text.toFloatOrNull() ?: 0f; else -> sets[idx].reps = text.toIntOrNull() ?: 0 } }
+                  holder.watcherB = watcher { text -> val idx = holder.adapterPosition; if (idx < 0) return@watcher; when (type) { ExerciseType.CARDIO -> sets[idx].speedKmh = text.toFloatOrNull() ?: 0f; else -> sets[idx].weightKg = text.toFloatOrNull() ?: 0f } }
+                  holder.etA.addTextChangedListener(holder.watcherA); holder.etB.addTextChangedListener(holder.watcherB)
+                  holder.btnDel.setOnClickListener { val idx = holder.adapterPosition; if (idx >= 0 && sets.size > 1) { sets.removeAt(idx); notifyItemRemoved(idx); notifyItemRangeChanged(idx, sets.size) } }
+              }
+              override fun getItemCount() = sets.size
+              private fun watcher(cb: (String) -> Unit) = object : TextWatcher { override fun beforeTextChanged(s: CharSequence?, st: Int, c: Int, a: Int) {}; override fun onTextChanged(s: CharSequence?, st: Int, b: Int, c: Int) {}; override fun afterTextChanged(s: Editable?) { cb(s?.toString().orEmpty()) } }
+          }
+          EOF
+
+          cat > app/src/main/java/com/sadtaz/workout/GraphActivity.kt << 'EOF'
+          package com.sadtaz.workout
+          import android.graphics.Color
+          import android.os.Bundle
+          import android.view.*
+          import android.widget.*
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.lifecycle.lifecycleScope
+          import com.github.mikephil.charting.charts.LineChart
+          import com.github.mikephil.charting.components.XAxis
+          import com.github.mikephil.charting.data.*
+          import com.github.mikephil.charting.formatter.IndexAxisValueFormatter
+          import kotlinx.coroutines.flow.collectLatest
+          import kotlinx.coroutines.launch
+          class GraphActivity : AppCompatActivity() {
+              private val repo by lazy { WorkoutRepository(WorkoutDatabase.getInstance(this).workoutDao()) }
+              private val allExercises = WorkoutPlan.days.flatMap { it.exercises }
+              private var selectedExercise = ""
+              private var chart: LineChart? = null
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContentView(R.layout.activity_graph)
+                  selectedExercise = allExercises.first()
+                  chart = findViewById(R.id.lineChart)
+                  styleChart()
+                  findViewById<ImageView>(R.id.btnBack).setOnClickListener { finish() }
+                  val spinner = findViewById<Spinner>(R.id.spinnerExercise)
+                  spinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, allExercises)
+                  spinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+                      override fun onItemSelected(p: AdapterView<*>, v: View?, pos: Int, id: Long) { selectedExercise = allExercises[pos]; loadGraph() }
+                      override fun onNothingSelected(p: AdapterView<*>) {}
+                  }
+                  loadPersonalRecords()
+              }
+              private fun styleChart() { chart?.apply { setBackgroundColor(Color.parseColor("#0D0D0D")); description.isEnabled = false; legend.isEnabled = false; setTouchEnabled(true); setPinchZoom(true); setDrawGridBackground(false); xAxis.apply { position = XAxis.XAxisPosition.BOTTOM; textColor = Color.parseColor("#666666"); gridColor = Color.parseColor("#1E1E1E"); axisLineColor = Color.parseColor("#1E1E1E"); granularity = 1f; setDrawAxisLine(true) }; axisLeft.apply { textColor = Color.parseColor("#666666"); gridColor = Color.parseColor("#1E1E1E"); axisLineColor = Color.parseColor("#1E1E1E") }; axisRight.isEnabled = false } }
+              private fun loadGraph() {
+                  val tvEmpty = findViewById<TextView>(R.id.tvChartEmpty)
+                  val type = getExerciseType(selectedExercise)
+                  lifecycleScope.launch {
+                      repo.getHistoryForExercise(selectedExercise).collectLatest { sets ->
+                          if (sets.isEmpty()) { chart?.visibility = View.GONE; tvEmpty?.visibility = View.VISIBLE; return@collectLatest }
+                          val byDate = sets.groupBy { it.loggedDate }.entries.sortedBy { it.key }
+                          val labels = byDate.map { it.key.substring(5).replace("-", "/") }
+                          val entries = byDate.mapIndexed { i, (_, daySets) -> Entry(i.toFloat(), when (type) { ExerciseType.PLANK, ExerciseType.CARDIO -> daySets.maxOf { it.minutes }; else -> daySets.maxOf { it.weightKg } }) }
+                          val accentColor = Color.parseColor("#E8FF00")
+                          val dataSet = LineDataSet(entries, "").apply { color = accentColor; setCircleColor(accentColor); circleRadius = 4f; circleHoleRadius = 2f; lineWidth = 2.5f; valueTextColor = Color.parseColor("#888888"); valueTextSize = 9f; setDrawFilled(true); fillColor = Color.parseColor("#E8FF00"); fillAlpha = 20; mode = LineDataSet.Mode.CUBIC_BEZIER; setDrawHighlightIndicators(true); highLightColor = Color.parseColor("#E8FF00") }
+                          chart?.apply { visibility = View.VISIBLE; tvEmpty?.visibility = View.GONE; xAxis.valueFormatter = IndexAxisValueFormatter(labels); data = LineData(dataSet); animateX(600); invalidate() }
+                      }
+                  }
+              }
+              private fun loadPersonalRecords() {
+                  val container = findViewById<LinearLayout>(R.id.prContainer)
+                  WorkoutPlan.days.flatMap { it.exercises }.forEach { ex ->
+                      val type = getExerciseType(ex)
+                      lifecycleScope.launch {
+                          val flow = if (type == ExerciseType.NORMAL) repo.getMaxWeight(ex) else repo.getMaxMinutes(ex)
+                          flow.collectLatest { value ->
+                              if (value != null && value > 0f) { runOnUiThread { if (container.findViewWithTag<View>(ex) == null) { val row = layoutInflater.inflate(R.layout.item_pr_row, container, false); row.tag = ex; val unit = if (type == ExerciseType.NORMAL) "kg" else "min"; row.findViewById<TextView>(R.id.tvPrName).text = ex; row.findViewById<TextView>(R.id.tvPrValue).text = "$value $unit"; container.addView(row) } else { val row = container.findViewWithTag<View>(ex); val unit = if (type == ExerciseType.NORMAL) "kg" else "min"; row?.findViewById<TextView>(R.id.tvPrValue)?.text = "$value $unit" } } }
+                          }
+                      }
+                  }
+              }
+          }
+          EOF
+
+      - name: Write XML Resources
+        run: |
+          cat > app/src/main/AndroidManifest.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application android:allowBackup="true" android:label="SADTAZ" android:theme="@style/Theme.SadtazWorkout">
+                  <activity android:name=".MainActivity" android:exported="true" android:screenOrientation="portrait" android:windowSoftInputMode="adjustResize">
+                      <intent-filter><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent-filter>
+                  </activity>
+                  <activity android:name=".LogWorkoutActivity" android:windowSoftInputMode="adjustResize"/>
+                  <activity android:name=".HistoryActivity"/>
+                  <activity android:name=".GraphActivity"/>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/res/values/colors.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <color name="bg">#000000</color><color name="card">#0D0D0D</color><color name="card2">#141414</color>
+              <color name="accent">#E8FF00</color><color name="accent2">#FF4D00</color><color name="text">#F5F5F5</color>
+              <color name="muted">#555555</color><color name="border">#1E1E1E</color><color name="black">#000000</color><color name="white">#FFFFFF</color>
+          </resources>
+          EOF
+
+          cat > app/src/main/res/values/strings.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources><string name="app_name">SADTAZ</string></resources>
+          EOF
+
+          cat > app/src/main/res/values/themes.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="Theme.SadtazWorkout" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+                  <item name="colorPrimary">@color/accent</item><item name="colorPrimaryVariant">@color/card</item>
+                  <item name="colorOnPrimary">@color/black</item><item name="colorSurface">@color/card</item>
+                  <item name="colorOnSurface">@color/text</item><item name="android:windowBackground">@color/bg</item>
+                  <item name="android:statusBarColor">@color/black</item><item name="android:navigationBarColor">@color/black</item>
+              </style>
+          </resources>
+          EOF
+
+          cat > app/src/main/res/drawable/bg_badge.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?><shape xmlns:android="http://schemas.android.com/apk/res/android"><solid android:color="#141414"/><corners android:radius="20dp"/><stroke android:width="1dp" android:color="#1E1E1E"/></shape>
+          EOF
+          cat > app/src/main/res/drawable/bg_card.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?><shape xmlns:android="http://schemas.android.com/apk/res/android"><solid android:color="#0D0D0D"/><corners android:radius="12dp"/><stroke android:width="1dp" android:color="#1E1E1E"/></shape>
+          EOF
+          cat > app/src/main/res/drawable/bg_input.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?><shape xmlns:android="http://schemas.android.com/apk/res/android"><solid android:color="#141414"/><corners android:radius="8dp"/><stroke android:width="1dp" android:color="#1E1E1E"/></shape>
+          EOF
+          cat > app/src/main/res/drawable/bg_set_num.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?><shape xmlns:android="http://schemas.android.com/apk/res/android"><solid android:color="#E8FF00"/><corners android:radius="8dp"/></shape>
+          EOF
+
+      - name: Write Layout Files
+        run: |
+          cat > app/src/main/res/layout/activity_main.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android" xmlns:app="http://schemas.android.com/apk/res-auto" android:layout_width="match_parent" android:layout_height="match_parent" android:background="@color/bg" android:orientation="vertical">
+              <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="horizontal" android:gravity="center_vertical" android:paddingHorizontal="16dp" android:paddingTop="20dp" android:paddingBottom="12dp">
+                  <TextView android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:text="SADTAZ" android:textColor="@color/accent" android:textSize="30sp" android:textStyle="bold" android:letterSpacing="0.15"/>
+                  <TextView android:id="@觟㚭�" android:layout_width="wrap_content" android:layout_height="wrap_content" android:background="@drawable/bg_badge" android:paddingHorizontal="12dp" android:paddingVertical="5dp" android:textColor="@color/muted" android:textSize="11sp"/>
+              </LinearLayout>
+                  <com.google.android.material.tabs.TabLayout android:id="@觟닚쪋�" android:layout_width="match_parent" android:layout_height="48dp" android:background="@color/bg" app:tabMode="scrollable" app:tabGravity="start" app:tabIndicatorHeight="3dp" app:tabIndicatorColor="@color/accent" app:tabTextColor="@color/muted" app:tabSelectedTextColor="@color/accent" app:tabPaddingStart="4dp" app:tabPaddingEnd="4dp"/>
+              <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="vertical" android:paddingHorizontal="16dp" android:paddingTop="14dp" android:paddingBottom="6dp">
+                  <TextView android:id="@觟㚲丫�" android:layout_width="wrap_content" android:layout_height="wrap_content" android:textColor="@color/text" android:textSize="34sp" android:textStyle="bold"/>
+                  <TextView android:id="@觟쮬牗�" android:layout_width="wrap_content" android:layout_height="wrap_content" android:textColor="@color/accent2" android:textSize="12sp" android:textAllCaps="true" android:letterSpacing="0.1"/>
+              </LinearLayout>
+              <androidx.recyclerview.widget.RecyclerView android:id="@觟천闪행�" android:layout_width="match_parent" android:layout_height="0dp" android:layout_weight="1" android:paddingHorizontal="16dp" android:paddingBottom="72dp" android:clipToPadding="false"/>
+              <LinearLayout android:layout_width="match_parent" android:layout_height="60dp" android:background="@color/card" android:elevation="10dp" android:orientation="horizontal">
+                  <TextView android:layout_width="0dp" android:layout_height="match_parent" android:layout_weight="1" android:gravity="center" android:text="���� Workout" android:textColor="@color/accent" android:textSize="13sp" android:textStyle="bold"/>
+                  <TextView android:id="@觟�燢닚�" android:layout_width="0dp" android:layout_height="match_parent" android:layout_weight="1" android:gravity="center" android:text="���� History" android:textColor="@color/muted" android:textSize="13sp"/>
+                  <TextView android:id="@觟�熫檘�" android:layout_width="0dp" android:layout_height="match_parent" android:layout_weight="1" android:gravity="center" android:text="���� Graph" android:textColor="@color/muted" android:textSize="13sp"/>
+                      </LinearLayout>
+          </LinearLayout>
+          EOF
+
+          cat > app/src/main/res/layout/activity_log_workout.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android" android:layout_width="match_parent" android:layout_height="match_parent" android:background="@color/bg" android:orientation="vertical">
+              <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:gravity="center_vertical" android:paddingHorizontal="16dp" android:paddingTop="20dp" android:paddingBottom="12dp">
+                  <ImageView android:id="@觟�灚�" android:layout_width="36dp" android:layout_height="36dp" android:src="@android:drawable/ic_menu_revert" android:tint="@color/text" android:padding="4dp"/>
+                  <LinearLayout android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:orientation="vertical" android:paddingStart="12dp">
+                      <TextView android:id="@觟䱞귈걹㢭�" android:layout_width="wrap_content" android:layout_height="wrap_content" android:textColor="@color/text" android:textSize="22sp" android:textStyle="bold"/>
+                      <TextView android:id="@觟쮬牗譩랥" android:layout_width="wrap_content" android:layout_height="wrap_content" android:textColor="@color/accent2" android:textSize="12sp" android:textAllCaps="true"/>
+                  </LinearLayout>
+              </LinearLayout>
+              <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:paddingHorizontal="16dp" android:paddingBottom="8dp">
+                  <TextView android:id="@觟⨥" android:layout_width="60dp" android:layout_height="wrap_content" android:textColor="@color/muted" android:textSize="11sp" android:textAllCaps="true"/>
+                  <TextView android:id="@觟⨥�" android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:gravity="center" android:textColor="@color/muted" android:textSize="11sp" android:textAllCaps="true"/>
+                  <TextView android:id="@觟⨥�" android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:gravity="center" android:textColor="@color/muted" android:textSize="11sp" android:textAllCaps="true"/>
+                  <View android:layout_width="44dp" android:layout_height="1dp"/>
+              </LinearLayout>
+              <androidx.recyclerview.widget.RecyclerView android:id="@觟➭�" android:layout_width="match_parent" android:layout_height="0dp" android:layout_weight="1" android:paddingHorizontal="16dp" android:clipToPadding="false"/>
+              <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="vertical" android:padding="16dp" android:background="@color/bg">
+                  <Button android:id="@觟�瀝甧�" android:layout_width="match_parent" android:layout_height="46dp" android:text="� Add Set" android:backgroundTint="@color/card2" android:textColor="@color/muted" android:layout_marginBottom="8dp"/>
+                  <Button android:id="@觟�璚�" android:layout_width="match_parent" android:layout_height="52dp" android:text="��� SAVE" android:backgroundTint="@color/accent" android:textColor="@color/black" android:textSize="16sp" android:textStyle="bold"/>
+              </LinearLayout>
+          </LinearLayout>
+          EOF
+
+          cat > app/src/main/res/layout/activity_history.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android" android:layout_width="match_parent" android:layout_height="match_parent" android:background="@color/bg" android:orientation="vertical">
+              <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:gravity="center_vertical" android:paddingHorizontal="16dp" android:paddingTop="20dp" android:paddingBottom="12dp">
+                  <ImageView android:id="@觟�灚�" android:layout_width="36dp" android:layout_height="36dp" android:src="@android:drawable/ic_menu_revert" android:tint="@color/text" android:padding="4dp"/>
+                  <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="HISTORY" android:textColor="@color/accent" android:textSize="22sp" android:textStyle="bold" android:paddingStart="12dp"/>
+              </LinearLayout>
+              <androidx.recyclerview.widget.RecyclerView android:id="@觟碬뚊�" android:layout_width="match_parent" android:layout_height="match_parent" android:paddingHorizontal="16dp" android:paddingBottom="16dp" android:clipToPadding="false"/>
+          </LinearLayout>
+          EOF
+
+          cat > app/src/main/res/layout/activity_graph.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android" android:layout_width="match_parent" android:layout_height="match_parent" android:background="@color/bg" android:orientation="vertical">
+              <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:gravity="center_vertical" android:paddingHorizontal="16dp" android:paddingTop="20dp" android:paddingBottom="12dp">
+                  <ImageView android:id="@觟�灚�" android:layout_width="36dp" android:layout_height="36dp" android:src="@android:drawable/ic_menu_revert" android:tint="@color/text" android:padding="4dp"/>
+                      <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="PROGRESS" android:textColor="@color/accent" android:textSize="22sp" android:textStyle="bold" android:paddingStart="12dp" android:letterSpacing="0.1"/>
+              </LinearLayout>
+              <ScrollView android:layout_width="match_parent" android:layout_height="0dp" android:layout_weight="1">
+                  <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="vertical" android:padding="16dp">
+                      <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="EXERCISE SELECT KARO" android:textColor="@color/muted" android:textSize="11sp" android:textAllCaps="true" android:letterSpacing="0.1" android:layout_marginBottom="8dp"/>
+                      <Spinner android:id="@觟⧧窱ㅺ뜢�" android:layout_width="match_parent" android:layout_height="48dp" android:background="@drawable/bg_card" android:paddingHorizontal="12dp"/>
+                      <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:background="@drawable/bg_card" android:orientation="vertical" android:padding="12dp" android:layout_marginTop="16dp">
+                          <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="WEIGHT / TIME PROGRESS" android:textColor="@color/muted" android:textSize="11sp" android:textAllCaps="true" android:letterSpacing="0.1" android:layout_marginBottom="12dp"/>
+                          <com.github.mikephil.charting.charts.LineChart android:id="@觟瞂薪�" android:layout_width="match_parent" android:layout_height="200dp"/>
+                          <TextView android:id="@觟⡚껑⚦�" android:layout_width="match_parent" android:layout_height="100dp" android:gravity="center" android:text="Koi data nahi" android:textColor="@color/muted" android:textSize="13sp" android:visibility="gone"/>
+                      </LinearLayout>
+                      <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:background="@drawable/bg_card" android:orientation="vertical" android:padding="16dp" android:layout_marginTop="12dp">
+                          <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="PERSONAL RECORDS ����" android:textColor="@color/muted" android:textSize="11sp" android:textAllCaps="true" android:letterSpacing="0.1" android:layout_marginBottom="8dp"/>
+                          <LinearLayout android:id="@觟⨧떨ꝺ�" android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="vertical"/>
+                      </LinearLayout>
+                  </LinearLayout>
+              </ScrollView>
+          </LinearLayout>
+          EOF
+
+          cat > app/src/main/res/layout/item_exercise.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android" android:layout_width="match_parent" android:layout_height="wrap_content" android:background="@drawable/bg_card" android:gravity="center_vertical" android:orientation="horizontal" android:padding="16dp" android:layout_marginBottom="10dp">
+              <LinearLayout android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:orientation="vertical">
+                  <TextView android:id="@觟䱞귈걸횦�" android:layout_width="wrap_content" android:layout_height="wrap_content" android:textColor="@color/text" android:textSize="15sp" android:textStyle="bold"/>
+                  <TextView android:id="@觟㚩亂�" android:layout_width="wrap_content" android:layout_height="wrap_content" android:textColor="@color/muted" android:textSize="12sp" android:layout_marginTop="2dp"/>
+              </LinearLayout>
+              <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="���" android:textColor="@color/muted" android:textSize="24sp"/>
+          </LinearLayout>
+          EOF
+
+          cat > app/src/main/res/layout/item_set_row.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android" android:layout_width="match_parent" android:layout_height="wrap_content" android:gravity="center_vertical" android:orientation="horizontal" android:layout_marginBottom="10dp">
+              <TextView android:id="@觟➭㛩�" android:layout_width="44dp" android:layout_height="44dp" android:background="@drawable/bg_set_num" android:gravity="center" android:textColor="@color/black" android:textSize="13sp" android:textStyle="bold"/>
+              <EditText android:id="@觟�增闐" android:layout_width="0dp" android:layout_height="44dp" android:layout_weight="1" android:layout_marginStart="8dp" android:background="@drawable/bg_input" android:gravity="center" android:hint="0" android:hintTextColor="@color/muted" android:inputType="numberDecimal" android:textColor="@color/text" android:textSize="16sp" android:textStyle="bold"/>
+              <EditText android:id="@觟�增闐�" android:layout_width="0dp" android:layout_height="44dp" android:layout_weight="1" android:layout_marginStart="8dp" android:background="@drawable/bg_input" android:gravity="center" android:hint="0" android:hintTextColor="@color/muted" android:inputType="numberDecimal" android:textColor="@color/text" android:textSize="16sp" android:textStyle="bold"/>
+              <EditText android:id="@觟�增闐�" android:layout_width="0dp" android:layout_height="44dp" android:layout_weight="1" android:layout_marginStart="8dp" android:background="@drawable/bg_input" android:gravity="center" android:hint="0" android:hintTextColor="@color/muted" android:inputType="numberDecimal" android:textColor="@color/text" android:textSize="16sp" android:textStyle="bold" android:visibility="gone"/>
+              <ImageView android:id="@觟�烞锧�" android:layout_width="36dp" android:layout_height="36dp" android:layout_marginStart="4dp" android:src="@android:drawable/ic_menu_close_clear_cancel" android:tint="@color/muted" android:padding="6dp"/>
+          </LinearLayout>
+          EOF
+
+          cat > app/src/main/res/layout/item_history_entry.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android" android:layout_width="match_parent" android:layout_height="wrap_content" android:background="@drawable/bg_card" android:orientation="vertical" android:padding="14dp" android:layout_marginBottom="8dp">
+              <TextView android:id="@觟䱍橧�" android:layout_width="wrap_content" android:layout_height="wrap_content" android:textColor="@color/text" android:textSize="15sp" android:textStyle="bold"/>
+              <TextView android:id="@觟㞭権�" android:layout_width="wrap_content" android:layout_height="wrap_content" android:textColor="@color/muted" android:textSize="12sp" android:layout_marginTop="3dp"/>
+          </LinearLayout>
+          EOF
+
+          cat > app/src/main/res/layout/item_history_date.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <TextView xmlns:android="http://schemas.android.com/apk/res/android" android:id="@觟㚭�" android:layout_width="match_parent" android:layout_height="wrap_content" android:paddingVertical="14dp" android:textColor="@color/accent" android:textSize="13sp" android:textStyle="bold" android:textAllCaps="true" android:letterSpacing="0.1"/>
+          EOF
+
+          cat > app/src/main/res/layout/item_pr_row.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android" android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="horizontal" android:gravity="center_vertical" android:paddingVertical="10dp">
+              <TextView android:id="@觟鬒橧�" android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:textColor="@color/text" android:textSize="14sp" android:textStyle="bold"/>
+              <TextView android:id="@觟𥉉橛�" android:layout_width="wrap_content" android:layout_height="wrap_content" android:textColor="@color/accent" android:textSize="18sp" android:textStyle="bold"/>
+          </LinearLayout>
+          EOF
+            - name: Write Gradle Files and Build
+        run: |
+          cat > app/build.gradle << 'EOF'
+          plugins {
+              id 'com.android.application'
+              id 'org.jetbrains.kotlin.android'
+              id 'kotlin-kapt'
+          }
+          android {
+              namespace 'com.sadtaz.workout'
+              compileSdk 34
+              defaultConfig { applicationId "com.sadtaz.workout"; minSdk 24; targetSdk 34; versionCode 1; versionName "1.0" }
+              buildTypes { release { minifyEnabled false } }
+              compileOptions { sourceCompatibility JavaVersion.VERSION_1_8; targetCompatibility JavaVersion.VERSION_1_8 }
+              kotlinOptions { jvmTarget = '1.8' }
+              buildFeatures { viewBinding true }
+          }
+          dependencies {
+              implementation 'androidx.core:core-ktx:1.12.0'
+              implementation 'androidx.appcompat:appcompat:1.6.1'
+              implementation 'com.google.android.material:material:1.11.0'
+              implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
+              implementation 'androidx.recyclerview:recyclerview:1.3.2'
+              implementation 'androidx.room:room-runtime:2.6.1'
+              implementation 'androidx.room:room-ktx:2.6.1'
+              kapt 'androidx.room:room-compiler:2.6.1'
+              implementation 'androidx.lifecycle:lifecycle-viewmodel-ktx:2.7.0'
+              implementation 'androidx.lifecycle:lifecycle-livedata-ktx:2.7.0'
+              implementation 'androidx.activity:activity-ktx:1.8.2'
+              implementation 'androidx.fragment:fragment-ktx:1.6.2'
+              implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3'
+              implementation 'com.github.PhilJay:MPAndroidChart:v3.1.0'
+          }
+          EOF
+
+          cat > build.gradle << 'EOF'
+          plugins {
+              id 'com.android.application' version '8.2.0' apply false
+              id 'org.jetbrains.kotlin.android' version '1.9.0' apply false
+          }
+          EOF
+
+          cat > settings.gradle << 'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral(); maven { url 'https://jitpack.io' } }
+          }
+          rootProject.name = "SadtazWorkout"
+          include ':app'
+          EOF
+
+          cat > gradle.properties << 'EOF'
+          android.useAndroidX=true
+          android.enableJetifier=true
+          org.gradle.jvmargs=-Xmx2048m
+          EOF
+
+          gradle wrapper --gradle-version 8.9
+          chmod � gradlew
+          ./gradlew assembleDebug
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SadtazWorkout-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
+          
+
+
+
+                
